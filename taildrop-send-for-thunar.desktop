@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Send via Taildrop
+Icon=network-transmit
+Exec=taildrop-send-for-thunar %F

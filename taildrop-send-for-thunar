@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# Send files to a Tailscale device with Taildrop.
+# Meant to be called from Thunar's "Send To" menu with the selected paths as arguments.
+
+set -uo pipefail
+set -m # background jobs get their own process group, so cancelling can kill the whole tree
+
+title="Send via Taildrop"
+
+error() {
+    zenity --error --no-markup --title="$title" --width=420 --text="$1" 2>/dev/null
+    exit 1
+}
+
+(( $# > 0 )) || error "No files selected."
+
+# Lines look like "IP<TAB>hostname<TAB>[status]"; status is empty for online devices.
+targets=$(tailscale file cp --targets 2>&1) || error "Could not list Taildrop targets:\n\n$(printf '%s' "$targets" | tail -n 5)"
+targets=$(grep -P '^\d+\.\d+\.\d+\.\d+\t' <<<"$targets")
+[[ -n $targets ]] || error "No devices available to send to."
+
+list=()
+while IFS=$'\t' read -r ip name status; do
+    list+=("$name" "${status:-online}" "$ip")
+done < <(awk -F'\t' '$3 == "" { print }' <<<"$targets"; awk -F'\t' '$3 != "" { print }' <<<"$targets")
+
+choice=$(zenity --list --title="$title" --text="Send $# item(s) to:" \
+    --column=Device --column=Status --column=IP --print-column=ALL --separator=$'\t' \
+    --width=520 --height=360 "${list[@]}" 2>/dev/null) || exit 0
+[[ -n $choice ]] || exit 0
+IFS=$'\t' read -r device _ target_ip <<<"$choice"
+
+folders=()
+for path in "$@"; do
+    [[ -d $path ]] && folders+=("$(basename "$path").zip")
+done
+if (( ${#folders[@]} > 0 )); then
+    zenity --warning --no-markup --title="$title" --width=420 \
+        --text="Taildrop only accepts files, so folders are zipped before sending. $device will receive:\n\n$(printf '%s\n' "${folders[@]}")" \
+        2>/dev/null || exit 0
+fi
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+# Taildrop only sends regular files, so directories get zipped first.
+paths=() total=0
+for path in "$@"; do
+    path=${path%/}
+    if [[ -d $path ]]; then
+        base=$(basename "$path")
+        mkdir -p "$tmp/zip"
+        (cd "$(dirname "$path")" && zip -qr "$tmp/zip/$base.zip" "$base") \
+            || error "Could not zip folder:\n$path"
+        path="$tmp/zip/$base.zip"
+    elif [[ ! -f $path || ! -r $path ]]; then
+        error "Cannot read file:\n$path"
+    fi
+    paths+=("$path")
+    (( total += $(stat -c %s "$path") ))
+done
+(( total > 0 )) || total=1
+
+# Streams each file through dd so its byte count can drive the progress bar.
+# Progress lines for zenity go to fd 3, since dd's stdout is the pipe into tailscale.
+send_all() {
+    exec 3>&1
+    local done_bytes=0 i=0 path name label size
+    for path in "${paths[@]}"; do
+        (( i++ ))
+        name=$(basename "$path")
+        size=$(stat -c %s "$path")
+        label=${name//&/&amp;} label=${label//</&lt;} label=${label//>/&gt;}
+        echo "# Sending $label ($i/${#paths[@]}) to $device"
+        LC_ALL=C dd if="$path" bs=1M status=progress 2> >(
+            tr '\r' '\n' | while read -r bytes unit _; do
+                [[ $unit == bytes && $bytes =~ ^[0-9]+$ ]] || continue
+                echo $(( (done_bytes + bytes) * 99 / total )) >&3
+            done
+        ) | tailscale file cp --name "$name" - "$target_ip:" 2>>"$tmp/error.log"
+        if (( PIPESTATUS[1] != 0 )); then
+            echo "$name" >"$tmp/failed"
+            echo 100
+            return 1
+        fi
+        (( done_bytes += size ))
+        echo $(( done_bytes * 99 / total ))
+    done
+    echo 100
+}
+
+mkfifo "$tmp/progress"
+send_all >"$tmp/progress" &
+sender=$!
+
+if ! zenity --progress --title="$title" --text="Preparing…" --percentage=0 \
+    --auto-close --width=420 <"$tmp/progress" 2>/dev/null; then
+    kill -- -"$sender" 2>/dev/null
+    wait "$sender" 2>/dev/null
+    notify-send -i network-transmit "$title" "Cancelled sending to $device" 2>/dev/null
+    exit 1
+fi
+
+if ! wait "$sender"; then
+    log=$(grep -v '^Warning: client version' "$tmp/error.log" | tail -n 5)
+    error "Sending $(<"$tmp/failed") to $device failed:\n\n$log"
+fi
+
+notify-send -i network-transmit "$title" "Sent ${#paths[@]} item(s) to $device" 2>/dev/null
+exit 0
